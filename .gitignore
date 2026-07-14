@@ -1,0 +1,5 @@
+.venv
+my_local_chroma_db
+.idea
+streamlit_workspace
+__pycache__/
