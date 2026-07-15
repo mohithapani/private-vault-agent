@@ -23,7 +23,7 @@ vector_store = Chroma(
 )
 
 # Fast, high-quality local answering engine
-chat_llm = ChatOllama(model="llama3.2", temperature=0.3)
+chat_llm = ChatOllama(model="llama3.2", temperature=0.1)
 
 
 # Establish a temporary workspace directory for saving the uploaded files
@@ -99,8 +99,18 @@ if user_query := st.chat_input("Ask a question about your documents..."):
     with st.chat_message("assistant"):
         with st.spinner("Scanning database and generating answer..."):
             try:
-                # 1. RETRIEVE matching reference material from Chroma
-                search_results = vector_store.similarity_search(user_query, k=3)
+                inputs = {
+                    "file_path": "",
+                    "query": user_query,
+                    "extracted_text": "",
+                    "filter_person": None,
+                    "identified_people": [],
+                    "search_results": []
+                }
+
+                result = local_rag_app.invoke(inputs)
+
+                search_results = result["search_results"]
 
                 if not search_results:
                     response_text = "No records matching that request were located inside your secure document database."
@@ -133,4 +143,3 @@ if user_query := st.chat_input("Ask a question about your documents..."):
 
             st.write(response_text)
             st.session_state.messages.append({"role": "assistant", "content": response_text})
-
