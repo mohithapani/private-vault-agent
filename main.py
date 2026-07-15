@@ -185,7 +185,6 @@ def classify_identity_node(state: AgentState) -> dict:
 
     try:
         result = structured_llm.invoke(f"{system_prompt}\n\nDocument Text:\n{text_content}")
-        print(result)
         people = result.detected_people if result.detected_people else ["unknown"]
 
         # Normalize names
@@ -207,33 +206,43 @@ def index_node(state: AgentState) -> dict:
     people_tags = state.get("identified_people", ["unknown"])
 
     if text_content and text_content.strip():
-        print('---Tags while ingestion---')
-        aliases = [
-                    alias
-                    for person in people_tags
-                    for alias in generate_person_aliases(person)
-                ]
+        # Chroma metadata values must be scalars (str/int/float/bool) -- it
+        # cannot store a Python list, and it has NO substring / "$contains"
+        # operator for metadata (that operator only applies to page_content
+        # via where_document). Storing "john_doe john doe john" as one big
+        # string and filtering with $contains silently matches nothing.
+        #
+        # Fix: expand each person into all of their aliases HERE (at index
+        # time) and store one canonical scalar id per tagged chunk. Then a
+        # simple $eq at query time is enough (see retrieve_node).
+        primary_people = [person.strip().lower() for person in people_tags]
+
         doc = Document(
             page_content=text_content,
             metadata={
                 "source": state["file_path"],
-                "belongs_to_people": [
-                    " ".join(aliases)
-                ]
             }
         )
 
         # Split the document into small chunks
         split_chunks = text_splitter.split_documents([doc])
 
+        # Index one tagged copy of each chunk per ALIAS of each person, so a
+        # partial-name query ("mohit") still finds a document classified
+        # under the full name ("mohit_hapani"). Aliases must be expanded
+        # here at index time -- expanding at query time can't reconstruct
+        # "mohit_hapani" from just "mohit".
+        tagged_chunks = []
         for chunk in split_chunks:
-            chunk.metadata["belongs_to_people"] = " ".join(aliases)
+            for person in primary_people:
+                for alias in generate_person_aliases(person):
+                    tagged_chunk = chunk.model_copy(deep=True)
+                    tagged_chunk.metadata["belongs_to_person"] = alias
+                    tagged_chunks.append(tagged_chunk)
 
-        print("---Metadata before indexing---")
-        for chunk in split_chunks:
-            print(chunk.metadata)
-        vector_store.add_documents(split_chunks)
-        print(f"-> Indexed {len(split_chunks)} chunks with metadata tags: {" ".join(aliases)}")
+        vector_store.add_documents(tagged_chunks)
+        print(f"-> Indexed {len(tagged_chunks)} chunks (from {len(split_chunks)} splits) "
+              f"tagged for: {primary_people}")
     return {"extracted_text": text_content}  # Return text to keep state pipeline valid
 
 
@@ -245,10 +254,13 @@ def retrieve_node(state: AgentState) -> dict:
     if query:
         # Build standard metadata filter dict dynamically
         if target_person:
-            print(f"Looking for -> {target_person.strip().lower()}")
+            normalized_target = target_person.strip().lower()
+            print(f"Looking for -> {normalized_target}")
+            # Chunks were tagged with every alias at index time, so a plain
+            # equality match on the normalized query term is sufficient.
             chroma_metadata_filter = {
-                "belongs_to_people": {
-                    "$contains": target_person.strip().lower()
+                "belongs_to_person": {
+                    "$eq": normalized_target
                 }
             }
 
