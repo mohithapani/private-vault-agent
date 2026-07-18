@@ -1,9 +1,11 @@
 import os
-import base64
+import cv2
+import numpy as np
+from PIL import Image
 from typing import TypedDict, List, Optional
-from io import BytesIO
-#from PIL import Image
 import pypdf
+from pdf2image import convert_from_path
+from paddleocr import PaddleOCR
 
 # LangChain / Community Modules
 from langchain_core.documents import Document
@@ -38,11 +40,73 @@ vector_store = Chroma(
     persist_directory=DB_DIR
 )
 
-# Vision LLM for Image Extraction
-vision_llm = ChatOllama(model="llava", temperature=0)
-
 # Fast Text LLM for Structured Person Classification
 classifier_llm = ChatOllama(model="llama3.2", temperature=0.1)
+
+ocr = PaddleOCR(
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+    lang="en"
+)
+
+def crop_scanned_document(pil_image):
+
+    img = np.array(pil_image)
+
+    gray = cv2.cvtColor(
+        img,
+        cv2.COLOR_RGB2GRAY
+    )
+
+    # Detect non-white pixels
+    mask = gray < 200
+
+    coords = np.column_stack(np.where(mask))
+
+    if len(coords) == 0:
+        return pil_image
+
+    y1, x1 = coords.min(axis=0)
+    y2, x2 = coords.max(axis=0)
+
+    padding = 50
+
+    x1 = max(0, x1-padding)
+    y1 = max(0, y1-padding)
+    x2 = min(img.shape[1], x2+padding)
+    y2 = min(img.shape[0], y2+padding)
+
+    cropped = img[y1:y2, x1:x2]
+
+    return Image.fromarray(cropped)
+
+
+def run_ocr_on_image(pil_image, crop: bool = True) -> str:
+    """Shared OCR routine used for BOTH standalone images and PDF page
+    images, so cropping/resizing/text-joining behavior is identical for
+    both input types instead of images going through a separate VLM path.
+    """
+    if crop:
+        pil_image = crop_scanned_document(pil_image)
+
+    pil_image = pil_image.convert("RGB")
+    pil_image.thumbnail(
+        (2500, 2500),
+        Image.Resampling.LANCZOS
+    )
+
+    img_array = np.array(pil_image)
+    # PaddleOCR accepts a numpy array
+    result = ocr.predict(img_array)
+
+    page_text = []
+    for block in result:
+        for line in block["rec_texts"]:
+            page_text.append(line)
+
+    return "\n".join(page_text)
+
 
 # Pydantic Schema to force the LLM to return clean person lists
 class IdentityClassification(BaseModel):
@@ -66,31 +130,46 @@ def extract_pdf_text(file_path: str) -> str:
     return text.strip()
 
 
-def extract_image_text_via_vlm(file_path: str) -> str:
-    """Encodes images to Base64 and hands off to Llava via LangChain."""
-    with open(file_path, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+def extract_image_text_via_ocr(file_path: str) -> str:
+    """OCRs a standalone image file (.png/.jpg/.jpeg) using the same
+    PaddleOCR engine/pipeline as scanned PDF pages (see run_ocr_on_image).
+    Replaces the previous llava/vision-LLM based extraction.
+    """
+    with Image.open(file_path) as img:
+        img.load()
+        return run_ocr_on_image(img)
 
-    # Structure prompt mimicking native LangChain ChatMessage schemas
-    prompt = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": (
-                    "Act as an OCR and identity document data extractor. Transcribe all visible "
-                    "text exactly. Extract full names, specific travel/employment dates, passport "
-                    "or legal ID numbers, and employer names. Avoid generalized summaries. The document "
-                    "can be uploaded for multiple different people so its necessary to ensure that we identify the "
-                    "person belonging to the information"
-                )},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-            ]
-        }
-    ]
 
-    response = vision_llm.invoke(prompt)
-    return response.content
+def extract_pdf_text_via_ocr(file_path: str) -> str:
+    """Converts PDF pages to images and extracts text using PaddleOCR."""
 
+    print(f"[1/4] Starting PDF conversion for: {os.path.basename(file_path)}")
+
+    try:
+        pages = convert_from_path(
+            file_path,
+            dpi=300,
+            thread_count=2,
+        )
+        print(f"[2/4] Successfully rendered {len(pages)} page(s).")
+    except Exception as e:
+        return f"Poppler conversion failed: {e}"
+
+    combined_text = []
+
+    for i, page in enumerate(pages):
+
+        print(f"[3/4] Running OCR on page {i + 1}...")
+
+        try:
+            combined_text.append(run_ocr_on_image(page))
+            print(f"-> Page {i + 1} complete.")
+
+        except Exception as e:
+            print(f"-> OCR failed on page {i + 1}: {e}")
+            combined_text.append(f"[OCR Error Page {i + 1}]")
+
+    return "\n\n".join(combined_text)
 
 # ==========================================
 # 3. LANGGRAPH ARCHITECTURE (State Machine)
@@ -155,9 +234,12 @@ def extract_node(state: AgentState) -> dict:
     extracted = ""
 
     if ext in [".png", ".jpg", ".jpeg"]:
-        extracted = extract_image_text_via_vlm(path)
+        extracted = extract_image_text_via_ocr(path)
     elif ext == ".pdf":
         extracted = extract_pdf_text(path)
+        # Fallback for reading pdf's which are scanned copies
+        if not extracted:
+            extracted = extract_pdf_text_via_ocr(path)
     elif ext in [".txt", ".md"]:
         with open(path, "r", encoding="utf-8") as f:
             extracted = f.read()
@@ -270,8 +352,6 @@ def retrieve_node(state: AgentState) -> dict:
                 k=2,
                 filter=chroma_metadata_filter,
             )
-
-            print(results)
 
             # Fallback if filtered search returns nothing
             if not results:

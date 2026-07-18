@@ -4,8 +4,9 @@ A fully local, privacy-preserving Retrieval-Augmented Generation (RAG) system
 for ingesting personal identity documents (PDFs, images, text files) and
 answering questions about them — scoped to a specific person when asked.
 
-Everything runs on your machine: document parsing, OCR/vision extraction,
-embeddings, vector storage, and the LLM itself, all via [Ollama](https://ollama.com).
+Everything runs on your machine: document parsing, OCR extraction,
+embeddings, vector storage, and the LLM itself, all via [Ollama](https://ollama.com)
+and a local [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) engine.
 No document content or query ever leaves your computer.
 
 ---
@@ -39,19 +40,44 @@ nodes that routes automatically between an *ingestion* pipeline and a
 - [pyenv](https://github.com/pyenv/pyenv) (Python version management)
 - [Poetry](https://python-poetry.org/) (dependency management)
 - [Ollama](https://ollama.com) (local LLM runtime)
-- ~8 GB free disk space for models (more if you use a larger vision model)
+- [Poppler](https://poppler.freedesktop.org/) (system dependency for
+  rendering PDF pages to images — required by `pdf2image`)
+- ~8 GB free disk space for models
+
+### Install Poppler
+
+`pdf2image` shells out to Poppler's `pdftoppm` binary, so it needs to be on
+your `PATH` separately from the Python dependencies.
+
+**macOS:**
+```bash
+brew install poppler
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt-get install poppler-utils
+```
+
+**Windows:** see the [pdf2image installation notes](https://github.com/Belval/pdf2image#windows).
 
 ---
 
 ## 1. Install Ollama and pull the required models
 
-Ollama runs the LLMs locally. This app uses three:
+Ollama runs the LLMs locally. This app uses two:
 
 | Purpose | Model | Used by |
 |---|---|---|
 | Embeddings | `nomic-embed-text` | `embedding_model` — turns text chunks into vectors for storage/search |
-| Vision / OCR | `llava` | `vision_llm` — reads text out of image uploads (e.g. photographed IDs) |
 | Text classification & routing | `llama3.2` | `classifier_llm` — figures out who a document belongs to, and who a query is about |
+
+> Text/OCR extraction (images **and** scanned PDFs) is handled locally by
+> **PaddleOCR**, a Python library rather than an Ollama model — there's
+> nothing to `ollama pull` for it, see [Section 3](#3-set-up-dependencies-with-poetry).
+> A prior version of this app used the `llava` vision model for image
+> OCR; that's no longer needed, since images and scanned PDFs now go
+> through the same PaddleOCR path (see [Architecture](#7-architecture--the-langgraph-nodes)).
 
 ### Install Ollama
 
@@ -84,7 +110,6 @@ In a separate terminal:
 
 ```bash
 ollama pull nomic-embed-text
-ollama pull llava
 ollama pull llama3.2
 ```
 
@@ -94,7 +119,7 @@ Verify they're installed:
 ollama list
 ```
 
-You should see all three models listed. You can sanity-check any one of them
+You should see both models listed. You can sanity-check either one
 directly:
 
 ```bash
@@ -154,12 +179,21 @@ langchain-text-splitters = "^0.3"
 langgraph = "^0.2"
 pydantic = "^2.9"
 pypdf = "^5.0"
+pdf2image = "^1.17"
+paddleocr = "^2.9"
+opencv-python = "^4.10"
+numpy = "^1.26"
+pillow = "^10.4"
 streamlit = "^1.38"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 ```
+
+> `paddleocr` downloads its detection/recognition model weights on first
+> use (cached locally afterward), so the first OCR call — on an image or a
+> scanned PDF — will take longer than subsequent ones.
 
 Once installed, run any script through Poetry's virtual environment:
 
@@ -208,7 +242,8 @@ Drag and drop one or more files (`.pdf`, `.png`, `.jpg`, `.jpeg`, `.txt`,
 `.md`), then click **🚀 Index Uploaded Files**. Each file is saved locally to
 a `streamlit_workspace/` folder (created automatically on first run) and run
 through the full ingestion pipeline — extract → classify → index — with a
-success/error status shown per file.
+success/error status shown per file. Note that OCR on images and scanned
+PDFs runs on CPU by default and can take a few seconds per page/image.
 
 **Main canvas — chat:**
 Type a question in the chat box (e.g. *"Give me John's I-94 admission
@@ -306,11 +341,21 @@ pipeline to run:
 
 **`extract_node`**
 Looks at the file extension and routes to the right extraction method:
-- `.png` / `.jpg` / `.jpeg` → `extract_image_text_via_vlm` (sends the image
-  to the `llava` vision model with an OCR-style prompt, asking it to
-  transcribe names, dates, ID numbers, and employer info verbatim)
-- `.pdf` → `extract_pdf_text` (uses `pypdf` to pull raw text page by page)
+- `.png` / `.jpg` / `.jpeg` → `extract_image_text_via_ocr` (runs the image
+  through the local **PaddleOCR** engine)
+- `.pdf` → `extract_pdf_text` (uses `pypdf` to pull raw text page by page);
+  if that comes back empty (a scanned PDF with no embedded text layer), it
+  falls back to `extract_pdf_text_via_ocr`, which renders each page to an
+  image via `pdf2image` and OCRs it
 - `.txt` / `.md` → read directly from disk
+
+Images and scanned-PDF pages both go through the **same shared OCR
+routine** (`run_ocr_on_image`): crop out surrounding whitespace/background,
+downscale to a max dimension PaddleOCR can handle, then run text detection
++ recognition. This replaces the earlier approach, where images were sent
+to the `llava` vision model with an OCR-style prompt — images and PDFs now
+produce text through an identical pipeline, so extraction quality no longer
+depends on which input type you upload.
 
 Output: raw extracted text, stored in `state["extracted_text"]`.
 
@@ -368,6 +413,11 @@ Runs a similarity search (`k=2`) against the vector store.
 - **Classification quality depends on the LLM.** `llama3.2` running locally
   is fast but not infallible — always spot-check `identified_people` on
   sensitive documents (the ingestion pipeline prints this to the console).
+- **OCR quality depends on image/scan quality.** PaddleOCR does well on
+  clean, reasonably high-resolution scans and photos, but low-light,
+  blurry, or heavily skewed images can produce garbled or missing text.
+  If extraction on a specific file looks off, check the console output for
+  the raw OCR'd text before assuming the classifier is at fault.
 - **No deletion/update flow.** Re-ingesting a corrected version of a
   document adds new chunks rather than replacing the old ones. If you need
   to correct a misclassified document, you'll need to remove its chunks
@@ -380,12 +430,26 @@ Runs a similarity search (`k=2`) against the vector store.
 **`ConnectionError` / model calls hang or fail**
 Ollama isn't running, or isn't reachable on `localhost:11434`. Run
 `ollama serve` in a separate terminal and confirm `ollama list` shows your
-models.
+models (`nomic-embed-text`, `llama3.2`).
 
 **Classification always returns `["unknown"]`**
 Usually means `extracted_text` was empty — check that the file path is
-correct and that PDF/image extraction actually produced text (some scanned
-PDFs with no embedded text layer will need OCR instead of `pypdf`).
+correct and that extraction actually produced text. For PDFs, confirm
+whether `extract_pdf_text` or the OCR fallback (`extract_pdf_text_via_ocr`)
+ran — the console prints `[1/4] Starting PDF conversion...` when the OCR
+fallback kicks in.
+
+**`Poppler conversion failed` error**
+`pdf2image` couldn't find the Poppler binaries. Confirm Poppler is
+installed and on your `PATH` (see [Prerequisites](#prerequisites)) —
+`pdftoppm -v` should print a version number if it's set up correctly.
+
+**OCR extraction is slow or produces garbled text**
+PaddleOCR runs on CPU by default unless you've configured a GPU build, so
+large batches of high-DPI pages/images can take a while — this is expected.
+If text comes out garbled, check the source image/scan quality first (see
+[Known limitations](#known-limitations)); very low-resolution or skewed
+scans are the most common cause.
 
 **Filtered search always falls back to global search**
 Check the console output under `---Metadata before indexing---` to confirm
