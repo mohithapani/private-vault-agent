@@ -7,6 +7,7 @@ from langchain_ollama import ChatOllama
 
 # Import your compiled LangGraph workflow from main.py
 from main import local_rag_app
+import person_registry
 
 # ==========================================
 # 1. APPLICATION & INFRASTRUCTURE SETUP
@@ -30,6 +31,10 @@ chat_llm = ChatOllama(model="llama3.2", temperature=0.1)
 UPLOAD_DIR = "streamlit_workspace"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Sentinel values for the person-selection dropdown
+NO_PERSON_OPTION = "-- No specific person (leave untagged) --"
+NEW_PERSON_OPTION = "+ Create new person"
+
 # ==========================================
 # 2. SIDEBAR FILE UPLOADER CONTROL PANEL
 # ==========================================
@@ -37,6 +42,23 @@ with st.sidebar:
     st.header("🎛️ Document Control Panel")
     st.write(
         "Upload new identity forms, travel receipts, or employment history files directly into your local database.")
+
+    # Pull the current known-people list fresh on every render so a
+    # newly-created person shows up in the dropdown right away.
+    known_people = person_registry.list_people()
+    person_options = [NO_PERSON_OPTION, NEW_PERSON_OPTION] + known_people
+
+    st.subheader("👤 Assign to person")
+    st.caption("This selection applies to every file in this upload batch.")
+    selected_option = st.selectbox(
+        "Who do these files belong to?",
+        options=person_options,
+        index=0,
+    )
+
+    new_person_name = ""
+    if selected_option == NEW_PERSON_OPTION:
+        new_person_name = st.text_input("New person's name (e.g. 'John Doe')")
 
     # Core drag-and-drop widget mapping your allowed file extensions
     uploaded_files = st.file_uploader(
@@ -50,26 +72,55 @@ with st.sidebar:
         if not uploaded_files:
             st.warning("Please select at least one file first.")
         else:
-            for uploaded_file in uploaded_files:
-                # Save the in-memory uploaded file bytes to your temporary workspace path
-                temp_file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-                with open(temp_file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+            # Resolve the batch-level person assignment once, up front.
+            assigned_person = None
+            valid_selection = True
 
-                # Show status tracker to the user
-                with st.spinner(f"Ingesting: {uploaded_file.name}..."):
-                    try:
-                        # Feed the local file path into your LangGraph architecture
-                        inputs = {
-                            "file_path": temp_file_path,
-                            "query": "",
-                            "extracted_text": "",
-                            "search_results": []
-                        }
-                        local_rag_app.invoke(inputs)
-                        st.success(f"Successfully Indexed: {uploaded_file.name}")
-                    except Exception as e:
-                        st.error(f"Failed parsing {uploaded_file.name}: {str(e)}")
+            if selected_option == NO_PERSON_OPTION:
+                assigned_person = None
+            elif selected_option == NEW_PERSON_OPTION:
+                if not new_person_name.strip():
+                    st.warning("Please enter a name for the new person.")
+                    valid_selection = False
+                else:
+                    assigned_person = person_registry.add_person(new_person_name)
+            else:
+                # An existing registered person was picked from the dropdown.
+                assigned_person = selected_option
+
+            if valid_selection:
+                for uploaded_file in uploaded_files:
+                    # Save the in-memory uploaded file bytes to your temporary workspace path
+                    temp_file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+                    with open(temp_file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+
+                    # Show status tracker to the user
+                    with st.spinner(f"Ingesting: {uploaded_file.name}..."):
+                        try:
+                            # Feed the local file path into your LangGraph architecture
+                            inputs = {
+                                "file_path": temp_file_path,
+                                "query": "",
+                                "extracted_text": "",
+                                "assigned_person": assigned_person,
+                                "filter_person": None,
+                                "matched_person": None,
+                                "search_results": []
+                            }
+                            local_rag_app.invoke(inputs)
+                            label = assigned_person if assigned_person else "no specific person"
+                            st.success(f"Successfully Indexed: {uploaded_file.name} (assigned to: {label})")
+                        except Exception as e:
+                            st.error(f"Failed parsing {uploaded_file.name}: {str(e)}")
+
+                # Refresh the sidebar so a newly-created person appears in the dropdown.
+                st.rerun()
+
+    if known_people:
+        with st.expander(f"📋 Known people ({len(known_people)})"):
+            for person_id in known_people:
+                st.write(f"- `{person_id}`")
 
 # ==========================================
 # 3. INTERACTIVE MAIN CHAT CANVAS
@@ -89,7 +140,6 @@ for msg in st.session_state.messages:
         st.write(msg["content"])
 
 # User interactive messaging query loop
-# User interactive messaging query loop
 if user_query := st.chat_input("Ask a question about your documents..."):
     with st.chat_message("user"):
         st.write(user_query)
@@ -103,8 +153,9 @@ if user_query := st.chat_input("Ask a question about your documents..."):
                     "file_path": "",
                     "query": user_query,
                     "extracted_text": "",
+                    "assigned_person": None,
                     "filter_person": None,
-                    "identified_people": [],
+                    "matched_person": None,
                     "search_results": []
                 }
 

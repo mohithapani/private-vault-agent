@@ -3,3 +3,4 @@ my_local_chroma_db
 .idea
 streamlit_workspace
 __pycache__/
+person_registry.json

@@ -17,6 +17,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 
+# Local person registry (JSON-backed; see person_registry.py)
+import person_registry
+
 # ==========================================
 # 1. SETUP CONFIGURATION & INFRASTRUCTURE
 # ==========================================
@@ -40,7 +43,7 @@ vector_store = Chroma(
     persist_directory=DB_DIR
 )
 
-# Fast Text LLM for Structured Person Classification
+# Fast Text LLM for query routing + persona matching
 classifier_llm = ChatOllama(model="llama3.2", temperature=0.1)
 
 ocr = PaddleOCR(
@@ -108,13 +111,6 @@ def run_ocr_on_image(pil_image, crop: bool = True) -> str:
     return "\n".join(page_text)
 
 
-# Pydantic Schema to force the LLM to return clean person lists
-class IdentityClassification(BaseModel):
-    detected_people: List[str] = Field(
-        description="List of full names or clean identity strings found in the document. Returns empty list if none."
-    )
-
-
 # ==========================================
 # 2. FILE EXTRACTION UTILITIES
 # ==========================================
@@ -130,10 +126,53 @@ def extract_pdf_text(file_path: str) -> str:
     return text.strip()
 
 
+def extract_pdf_text_hybrid(file_path: str, min_chars_before_ocr: int = 20) -> str:
+    """
+    Extracts text from a PDF page-by-page rather than all-or-nothing.
+
+    Multi-page ID documents (e.g. a passport's photo/biodata page vs. its
+    address page) often mix an embedded text layer on some pages with pages
+    that are purely a scanned image. The previous approach only ran OCR
+    when the ENTIRE document came back empty -- so if even one page had a
+    little embedded text (a stray MRZ line, a header), OCR was skipped
+    entirely and any purely-scanned pages silently lost all their content.
+
+    Here, each page is checked individually: if its embedded text is empty
+    or suspiciously short, that specific page (and only that page) is
+    rendered to an image and OCR'd, then stitched back in at the right
+    position. Pages with a real text layer are left as-is.
+    """
+    with open(file_path, "rb") as f:
+        reader = pypdf.PdfReader(f)
+        num_pages = len(reader.pages)
+        page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
+
+    combined = []
+    for i, page_text in enumerate(page_texts):
+        if len(page_text) >= min_chars_before_ocr:
+            combined.append(page_text)
+            continue
+
+        print(f"-> Page {i + 1}/{num_pages} has little/no embedded text "
+              f"({len(page_text)} chars) -- running OCR on this page.")
+        try:
+            rendered = convert_from_path(
+                file_path, dpi=300, first_page=i + 1, last_page=i + 1, thread_count=1
+            )
+            ocr_text = run_ocr_on_image(rendered[0]) if rendered else ""
+            # Keep whichever is longer/non-empty; OCR is expected to win here,
+            # but this guards against an OCR call that returns nothing.
+            combined.append(ocr_text or page_text)
+        except Exception as e:
+            print(f"-> OCR failed on page {i + 1}: {e}")
+            combined.append(page_text)
+
+    return "\n\n".join(t for t in combined if t.strip())
+
+
 def extract_image_text_via_ocr(file_path: str) -> str:
     """OCRs a standalone image file (.png/.jpg/.jpeg) using the same
     PaddleOCR engine/pipeline as scanned PDF pages (see run_ocr_on_image).
-    Replaces the previous llava/vision-LLM based extraction.
     """
     with Image.open(file_path) as img:
         img.load()
@@ -178,9 +217,11 @@ class AgentState(TypedDict):
     file_path: str
     query: str
     extracted_text: str
-    filter_person: Optional[str]
-    identified_people: List[str]
+    assigned_person: Optional[str]   # person explicitly chosen at upload time (None/"" = untagged)
+    filter_person: Optional[str]     # raw name text extracted from the query
+    matched_person: Optional[str]    # canonical registered person resolved from filter_person
     search_results: List[Document]
+
 
 class QueryRouter(BaseModel):
     extracted_person: Optional[str] = Field(
@@ -189,8 +230,15 @@ class QueryRouter(BaseModel):
     )
 
 
+class PersonMatch(BaseModel):
+    matched_person: Optional[str] = Field(
+        default=None,
+        description="The single best-matching canonical person id from the KNOWN PEOPLE list, or None if no reasonable match exists."
+    )
+
+
 def query_routing_node(state: AgentState) -> dict:
-    """Node: Automatically populates filter_person by parsing the query."""
+    """Node: Automatically populates filter_person by parsing the query text."""
     query = state.get("query", "")
     print(f"-> Query: {query}")
 
@@ -225,19 +273,74 @@ def query_routing_node(state: AgentState) -> dict:
     return {"filter_person": extracted}
 
 
+def persona_match_node(state: AgentState) -> dict:
+    """Node: Resolves the raw name text extracted from the query against the
+    registry of known, explicitly-tagged people. This replaces the old
+    auto-classification step -- instead of guessing who a document belongs
+    to, we ask the LLM to pick the best matching *registered* person for
+    whatever name the user typed (e.g. 'john' -> 'john_doe'). If nothing
+    matches (or no people are registered yet), matched_person is None and
+    retrieval falls through to plain semantic search.
+    """
+    raw_name = state.get("filter_person")
+    if not raw_name:
+        return {"matched_person": None}
+
+    known_people = person_registry.list_people()
+    if not known_people:
+        print("-> No registered people yet; skipping persona match.")
+        return {"matched_person": None}
+
+    matcher_llm = classifier_llm.with_structured_output(PersonMatch)
+
+    system_prompt = (
+        "You are matching a name mentioned in a search query to a canonical list of "
+        "known person identifiers. Person identifiers are lowercase, words joined by "
+        "underscores (e.g. 'john_doe'). Pick the single best matching identifier from "
+        "the KNOWN PEOPLE list for the QUERY NAME below. A partial match, such as "
+        "'john' matching 'john_doe', is valid and expected. If nothing in the list "
+        "reasonably matches the query name, output None.\n\n"
+        f"KNOWN PEOPLE: {known_people}\n"
+        f"QUERY NAME: {raw_name}"
+    )
+
+    try:
+        decision = matcher_llm.invoke(system_prompt)
+        matched = decision.matched_person
+        if matched:
+            matched = matched.strip().lower()
+            if matched not in known_people:
+                # LLM returned something outside the registry -- don't trust it.
+                print(f"-> Persona matcher returned unknown id '{matched}', discarding.")
+                matched = None
+    except Exception:
+        matched = None
+
+    print(f"-> Persona match resolved '{raw_name}' -> '{matched}'")
+    return {"matched_person": matched}
+
+
 def extract_node(state: AgentState) -> dict:
     """Node: Identifies format routing and pulls text raw states."""
     path = state["file_path"]
 
-    # Fix applied here: index [1] grabs the extension string directly
     ext = os.path.splitext(path)[1].lower()
     extracted = ""
 
     if ext in [".png", ".jpg", ".jpeg"]:
         extracted = extract_image_text_via_ocr(path)
     elif ext == ".pdf":
-        extracted = extract_pdf_text(path)
-        # Fallback for reading pdf's which are scanned copies
+        try:
+            # Per-page hybrid: OCRs only the specific pages that lack a
+            # usable embedded text layer, instead of an all-or-nothing
+            # check on the whole document (see extract_pdf_text_hybrid).
+            extracted = extract_pdf_text_hybrid(path)
+        except Exception as e:
+            print(f"-> Per-page hybrid extraction failed ({e}); "
+                  f"falling back to full-document OCR.")
+            extracted = extract_pdf_text_via_ocr(path)
+        # Last-resort fallback if the hybrid path still came back empty
+        # (e.g. pypdf couldn't read the file structure at all).
         if not extracted:
             extracted = extract_pdf_text_via_ocr(path)
     elif ext in [".txt", ".md"]:
@@ -247,58 +350,18 @@ def extract_node(state: AgentState) -> dict:
     return {"extracted_text": extracted}
 
 
-def classify_identity_node(state: AgentState) -> dict:
-    """Node: Analyzes extracted text to parse exactly who this document belongs to."""
-    text_content = state.get("extracted_text", "")
-
-    if not text_content.strip():
-        return {"identified_people": ["unknown"]}
-
-    # Force the text model to strictly output the structured JSON array
-    structured_llm = classifier_llm.with_structured_output(IdentityClassification)
-
-    system_prompt = (
-        "You are an identity classification engine. Analyze the provided text and "
-        "extract the names of all unique individuals whom this bill, form, or document "
-        "belongs to. Normalize the output text names to lowercase words joined by underscores "
-        "(e.g., 'john_doe', 'person_x'). If you find an email address like 'john_doe@gmail.com', "
-        "strip the domain and clean it to a standardized identifier like 'john_doe'"
-    )
-
-    try:
-        result = structured_llm.invoke(f"{system_prompt}\n\nDocument Text:\n{text_content}")
-        people = result.detected_people if result.detected_people else ["unknown"]
-
-        # Normalize names
-        people = [
-            person.strip().lower().replace(" ", "_")
-            for person in people
-        ]
-    except Exception:
-        # Fallback if structured output fails locally
-        people = ["unknown"]
-
-    print(f"-> Classified Document Ownership: {people}")
-    return {"identified_people": people}
-
-
 def index_node(state: AgentState) -> dict:
-    """Node: Packs clean string structures into Vector representations with targeted metadata."""
+    """Node: Packs clean string structures into Vector representations with
+    targeted metadata. The owning person is now whatever was explicitly
+    chosen at upload time (state['assigned_person']) -- there is no more
+    LLM-based auto-identification. If no person was chosen, chunks are
+    stored untagged so they only ever surface via unfiltered semantic
+    search, never via a person filter.
+    """
     text_content = state.get("extracted_text", "")
-    people_tags = state.get("identified_people", ["unknown"])
+    assigned_person = (state.get("assigned_person") or "").strip().lower()
 
     if text_content and text_content.strip():
-        # Chroma metadata values must be scalars (str/int/float/bool) -- it
-        # cannot store a Python list, and it has NO substring / "$contains"
-        # operator for metadata (that operator only applies to page_content
-        # via where_document). Storing "john_doe john doe john" as one big
-        # string and filtering with $contains silently matches nothing.
-        #
-        # Fix: expand each person into all of their aliases HERE (at index
-        # time) and store one canonical scalar id per tagged chunk. Then a
-        # simple $eq at query time is enough (see retrieve_node).
-        primary_people = [person.strip().lower() for person in people_tags]
-
         doc = Document(
             page_content=text_content,
             metadata={
@@ -309,40 +372,52 @@ def index_node(state: AgentState) -> dict:
         # Split the document into small chunks
         split_chunks = text_splitter.split_documents([doc])
 
-        # Index one tagged copy of each chunk per ALIAS of each person, so a
-        # partial-name query ("mohit") still finds a document classified
-        # under the full name ("mohit_hapani"). Aliases must be expanded
-        # here at index time -- expanding at query time can't reconstruct
-        # "mohit_hapani" from just "mohit".
-        tagged_chunks = []
-        for chunk in split_chunks:
-            for person in primary_people:
-                for alias in generate_person_aliases(person):
+        if assigned_person:
+            # Chroma metadata values must be scalars and there's no
+            # substring operator on metadata, so -- same as before -- we
+            # expand the assigned person into every alias (full name,
+            # underscored form, first name) and store one tagged copy of
+            # each chunk per alias. This is what lets a later query for
+            # "john" match a document explicitly assigned to "john_doe".
+            tagged_chunks = []
+            for chunk in split_chunks:
+                for alias in generate_person_aliases(assigned_person):
                     tagged_chunk = chunk.model_copy(deep=True)
                     tagged_chunk.metadata["belongs_to_person"] = alias
                     tagged_chunks.append(tagged_chunk)
 
-        vector_store.add_documents(tagged_chunks)
-        print(f"-> Indexed {len(tagged_chunks)} chunks (from {len(split_chunks)} splits) "
-              f"tagged for: {primary_people}")
+            vector_store.add_documents(tagged_chunks)
+
+            # Register the person (idempotent) and record this file against them.
+            person_registry.add_person(assigned_person)
+            person_registry.record_file(assigned_person, state["file_path"])
+
+            print(f"-> Indexed {len(tagged_chunks)} chunks (from {len(split_chunks)} splits) "
+                  f"tagged for: {assigned_person}")
+        else:
+            # No person chosen -- store untagged. These chunks are simply
+            # absent from the 'belongs_to_person' field, so a person-filtered
+            # search will never match them, but a blanket semantic search will.
+            vector_store.add_documents(split_chunks)
+            print(f"-> Indexed {len(split_chunks)} chunks (unassigned, no person tag)")
+
     return {"extracted_text": text_content}  # Return text to keep state pipeline valid
 
 
 def retrieve_node(state: AgentState) -> dict:
     """Node: Runs similarity indexing based on vectorized queries."""
     query = state.get("query", "")
-    target_person = state.get("filter_person", None)
+    target_person = state.get("matched_person", None)
     results = []
     if query:
-        # Build standard metadata filter dict dynamically
         if target_person:
-            normalized_target = target_person.strip().lower()
-            print(f"Looking for -> {normalized_target}")
-            # Chunks were tagged with every alias at index time, so a plain
-            # equality match on the normalized query term is sufficient.
+            print(f"Looking for -> {target_person}")
+            # Chunks were tagged with every alias at index time, and
+            # matched_person is guaranteed to be a real registered id, so a
+            # plain equality match is sufficient.
             chroma_metadata_filter = {
                 "belongs_to_person": {
-                    "$eq": normalized_target
+                    "$eq": target_person
                 }
             }
 
@@ -365,7 +440,7 @@ def retrieve_node(state: AgentState) -> dict:
                     filter=None,
                 )
         else:
-            print("--No target person provided. Executing global semantic search.--")
+            print("--No matched person. Executing global semantic search.--")
             results = vector_store.similarity_search(
                 query=query,
                 k=2,
@@ -422,9 +497,9 @@ def generate_person_aliases(name: str) -> list[str]:
 workflow = StateGraph(AgentState)
 
 workflow.add_node("extractor", extract_node)
-workflow.add_node("classifier", classify_identity_node)
 workflow.add_node("indexer", index_node)
 workflow.add_node("router", query_routing_node)
+workflow.add_node("persona_matcher", persona_match_node)
 workflow.add_node("retriever", retrieve_node)
 
 # Build execution routing pipelines
@@ -439,12 +514,14 @@ workflow.add_conditional_edges(
     }
 )
 # RUNTIME INGESTION PATHWAY
-workflow.add_edge("extractor", "classifier")  # Route text to classifier first
-workflow.add_edge("classifier", "indexer")    # Feed classification data into storage indexing
+# (No more auto-classification step -- the person is provided explicitly
+# in state['assigned_person'] from the UI, so text goes straight to indexing.)
+workflow.add_edge("extractor", "indexer")
 workflow.add_edge("indexer", END)
 
 # RUNTIME QUERY PATHWAY
-workflow.add_edge("router", "retriever")
+workflow.add_edge("router", "persona_matcher")
+workflow.add_edge("persona_matcher", "retriever")
 workflow.add_edge("retriever", END)
 
 local_rag_app = workflow.compile()
